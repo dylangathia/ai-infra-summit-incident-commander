@@ -113,13 +113,16 @@ class Commander:
             # p99 lags the fix: requests already queued carry their old wait
             # time to completion. A shrinking backlog means the remedy IS
             # working even while latency looks flat.
-            if cur < best * 0.95 or backlog < best_backlog * 0.95:
+            latency_better = cur < best * 0.95
+            backlog_better = backlog < best_backlog * 0.95
+            if latency_better or backlog_better:
                 best = min(best, cur)
                 best_backlog = min(best_backlog, backlog)
                 stall = 0
                 self._emit("verify_progress", incident_id=incident_id,
                            attempt=attempt, p99_ms=round(cur),
-                           backlog=backlog, trend="improving")
+                           backlog=backlog,
+                           driver="latency" if latency_better else "backlog")
             elif i >= GRACE_WINDOWS:
                 stall += 1
                 if stall >= STALL_WINDOWS:

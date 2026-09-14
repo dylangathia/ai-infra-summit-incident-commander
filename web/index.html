@@ -481,9 +481,12 @@
         if (e.kind === "executed")
           return `<div class="ev act">${t}<div class="what">Acted</div>
             <p>${(e.results || []).join("; ") || "nothing"}</p></div>`;
-        if (e.kind === "verify_progress")
-          return `<div class="ev act">${t}<div class="what">Watching</div>
-            <p>p99 ${e.p99_ms}ms, backlog ${e.backlog ?? "—"} — improving, holding off</p></div>`;
+        if(e.kind==="verify_progress"){
+            const why = e.driver==="backlog"
+              ? `backlog draining (${e.backlog} left) — p99 ${e.p99_ms}ms still lags, holding off`
+              : `p99 falling to ${e.p99_ms}ms — holding off`;
+            return `<div class="ev act">${t}<div class="what">Watching</div><p>${why}</p></div>`;
+          }
         if (e.kind === "verification")
           return `<div class="ev ${e.verified ? "good" : "open"}">${t}
             <div class="what">${e.verified ? "Recovered" : "Action failed"}</div>
