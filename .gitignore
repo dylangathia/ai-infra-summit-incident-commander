@@ -18,7 +18,6 @@ htmlcov/
 
 # Local environment and secrets
 .env
-.env.*
 *.pem
 *.key
 
