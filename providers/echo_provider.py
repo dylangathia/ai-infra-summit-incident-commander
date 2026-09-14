@@ -29,6 +29,9 @@ PLAN = [
 
 class EchoProvider:
     name = "echo"
+    # This one rebuilds its state by parsing tool results out of the message
+    # history, so truncating them would feed it malformed JSON.
+    compact_history = False
 
     # ---------- interface ----------
 

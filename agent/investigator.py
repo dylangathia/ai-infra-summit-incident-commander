@@ -18,7 +18,16 @@ from fleet.cluster import Cluster
 from providers.base import ModelResponse, Provider, ToolCall
 from telemetry import tools as telemetry_tools
 
-MAX_STEPS = 8
+MAX_STEPS = 9
+MAX_METRIC_COMPARISONS = 4    # beyond this, more metrics stop adding evidence
+# Tool payloads are small — all six together are ~775 tokens. The dominant
+# per-call cost is resending the system prompt, which compaction cannot help
+# with. Truncating results therefore saved almost nothing and destroyed the
+# early evidence (throughput direction, first dispersion check) that the
+# conclusion depends on. These bounds only catch pathological growth; rate
+# limits are handled by provider backoff instead.
+KEEP_FULL_RESULTS = 12
+TRUNCATE_TO = 1200
 
 ACTIONS = [
     "drain_node",           # args: {"node_id": str}
@@ -29,60 +38,65 @@ ACTIONS = [
     "no_action",            # args: {}
 ]
 
-SYSTEM = f"""You are the on-call SRE for a GPU inference fleet serving LLM
-traffic to several tenants. An SLO breach has been detected and you must find
-the root cause.
+SYSTEM = f"""You are the on-call SRE for a GPU inference fleet serving several
+tenants. An SLO breach has been detected. Find the root cause.
 
-How this fleet works:
-- Each node serves requests with continuous batching. Throughput per request
-  falls as batch size rises.
-- Each node has a fixed KV cache. Long prompts consume it fast. When it
-  saturates, in-flight sequences are preempted and must recompute from
-  scratch, which is far more expensive than it sounds.
-- The load balancer routes to the node with the fewest outstanding requests.
-  A node that is not serving anything therefore looks like the emptiest node
-  in the fleet and attracts traffic.
-- Nodes can thermally throttle, be redeployed at a different quantization,
-  or hang while loading weights. The balancer does not know any of this.
+Fleet mechanics:
+- Continuous batching; per-request throughput falls as batch size rises.
+- Fixed KV cache per node. Long prompts fill it; when it saturates, sequences
+  are preempted and must recompute, which is far costlier than it looks.
+- The balancer routes to fewest outstanding requests, so a node serving
+  nothing looks emptiest and attracts traffic it cannot handle.
+- Nodes thermally throttle, get redeployed at a different quantization, or
+  hang loading weights. The balancer knows none of this.
 
-How to investigate:
-1. Establish what changed at the fleet level, including the direction of
-   throughput. Latency rising with throughput means something different from
-   latency rising while throughput falls.
-2. Determine whether the anomaly is CONCENTRATED on particular nodes or
-   UNIFORM across all of them. This single distinction rules out half the
-   possible causes. Do not skip it.
-3. If uniform, the cause is demand-side or fleet-wide: look at per-tenant
-   behaviour, and distinguish more requests from bigger requests.
-4. If concentrated, identify the node and find out what is different about
-   it: logs, recent deploys, its physical state.
-5. Two different causes can produce the same symptom on one metric. Before
-   concluding, check a second metric that would separate them.
+Method:
+1. get_cluster_summary first. Note throughput_direction: rising means
+   demand-side, falling means supply-side, flat means the fleet got slower at
+   unchanged load.
+2. Establish dispersion with compare_nodes. Read the `dispersion_verdict` and
+   `outliers` fields and trust them. Do NOT eyeball per-node numbers — four
+   loaded nodes always have spread, and judging by eye is how a busy fleet
+   gets mistaken for a broken one. Three or four metrics is enough; more will
+   not change the picture.
+3. UNIFORM everywhere means no sick node, so the cause is demand-side or
+   fleet-wide. get_top_talkers decides it — read its `demand_verdict` the
+   same way you read dispersion_verdict, and do not infer from the tenant
+   list yourself. BROAD means everyone is sending more: scale up, and never
+   rate-limit, which would punish tenants who did nothing wrong. CONCENTRATED
+   means one tenant is crowding out the others: rate-limit that one. A tenant
+   sending *bigger* prompts at an unchanged rate is a third thing again and
+   needs cap_context. Check get_recent_events for a deploy too.
+4. CONCENTRATED means find what is different about that node — its logs,
+   a recent deploy, its physical state.
+5. Two causes can share one symptom. Check a second metric that separates
+   them before concluding.
 
-Be skeptical of the obvious reading. A fleet where every node is equally
-loaded is not a fleet with a broken node, however bad the latency looks.
+Call several tools in one turn when you know what you need — it is faster and
+cheaper than one at a time.
 
-When you are confident, reply with ONLY a JSON object, no prose around it:
+Your evidence list must state the throughput_direction and the
+dispersion_verdict for each metric you compared. Your ruled_out list is not
+optional: name what you considered and what specifically refuted it.
+
+When confident, reply with ONLY this JSON, no prose around it:
 
 {{
-  "root_cause": "<short slug, e.g. thermal_throttle_on_node>",
-  "summary": "<one sentence an on-call engineer would write>",
-  "confidence": <0.0 to 1.0>,
-  "evidence": ["<specific observation with numbers>", "..."],
-  "ruled_out": [{{"cause": "<what you considered>", "why": "<what refuted it>"}}],
+  "root_cause": "<short slug>",
+  "summary": "<one sentence>",
+  "confidence": <0.0-1.0>,
+  "evidence": ["<observation with numbers>"],
+  "ruled_out": [{{"cause": "<considered>", "why": "<refuted by>"}}],
   "recommended_action": {{"action": "<one of: {', '.join(ACTIONS)}>", "args": {{}}}}
 }}
 
-Action arguments:
+Action args:
 - drain_node / rollback_node: {{"node_id": "gpu-XX"}}
 - rate_limit_tenant: {{"tenant": "<name>", "admit_fraction": 0.05}}
 - cap_context: {{"max_tokens": 2048}}
-- scale_up: {{"count": <int>}}  — remember that matching demand exactly leaves
-  a permanent backlog; recovery needs surplus capacity.
-- no_action: {{}}
-
-Your "ruled_out" list is not optional. State what you considered and what
-specifically refuted it."""
+- scale_up: {{"count": <int>}} — matching demand exactly leaves a permanent
+  backlog; recovery needs surplus.
+- no_action: {{}}"""
 
 
 @dataclass
@@ -150,6 +164,64 @@ def _extract_json(text: str) -> Optional[dict]:
     return None
 
 
+def _compact(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Truncate older tool results in place.
+
+    Every step resends the whole history, so context grows quadratically and a
+    single investigation can exceed a free tier's tokens-per-minute budget.
+    Older results are truncated rather than removed, because dropping a tool
+    message without its matching tool_call breaks both providers' validation.
+    """
+    idx = [i for i, m in enumerate(messages) if _is_tool_result(m)]
+    for i in idx[:-KEEP_FULL_RESULTS] if len(idx) > KEEP_FULL_RESULTS else []:
+        m = messages[i]
+        if isinstance(m.get("content"), str):
+            if len(m["content"]) > TRUNCATE_TO:
+                m["content"] = m["content"][:TRUNCATE_TO] + " …(earlier result truncated)"
+        elif isinstance(m.get("content"), list):
+            for block in m["content"]:
+                if isinstance(block, dict) and isinstance(block.get("content"), str) \
+                        and len(block["content"]) > TRUNCATE_TO:
+                    block["content"] = block["content"][:TRUNCATE_TO] + " …(earlier result truncated)"
+    return messages
+
+
+def _is_tool_result(m: Dict[str, Any]) -> bool:
+    if m.get("role") == "tool":
+        return True
+    content = m.get("content")
+    return (m.get("role") == "user" and isinstance(content, list)
+            and any(isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in content))
+
+
+def _missing_evidence(inv: "Investigation") -> Optional[str]:
+    """Refuse a conclusion that skipped the check its own findings demanded.
+
+    A model that establishes UNIFORM dispersion everywhere has ruled out a
+    sick node — which means the cause is demand-side, and it cannot know
+    which without looking at per-tenant behaviour. Concluding at that point
+    is a guess dressed as a finding.
+    """
+    used = {s.tool_name for s in inv.steps if s.kind == "tool"}
+    verdicts = [(s.tool_result or {}).get("dispersion_verdict", "")
+                for s in inv.steps if s.tool_name == "compare_nodes"]
+    all_uniform = bool(verdicts) and all(v.startswith("UNIFORM") for v in verdicts)
+
+    if all_uniform and "get_top_talkers" not in used:
+        return ("Every metric you compared came back UNIFORM, so you have "
+                "ruled out a single degraded node. That makes this demand-side "
+                "or fleet-wide. You have not yet called get_top_talkers, so you "
+                "cannot know whether a tenant changed its request rate or its "
+                "request size — and those are different incidents with "
+                "different remedies. Call it before concluding.")
+    if all_uniform and "get_recent_events" not in used:
+        return ("Before concluding a fleet-wide cause, check get_recent_events "
+                "for a deploy or scaling action that would explain it. If there "
+                "is none, say so in your evidence.")
+    return None
+
+
 def investigate(cluster: Cluster, provider: Provider,
                 incident_note: str = "", max_steps: int = MAX_STEPS) -> Investigation:
     inv = Investigation()
@@ -161,13 +233,27 @@ def investigate(cluster: Cluster, provider: Provider,
         "changed at the fleet level."
     )
     messages: List[Dict[str, Any]] = [{"role": "user", "content": opening}]
+    nudged = False
+    steered = False
 
-    for _ in range(max_steps):
+    for step in range(max_steps):
+        final_step = step == max_steps - 1
+        if final_step:
+            messages.append({
+                "role": "user",
+                "content": ("You have used your tool budget. Do not call any more "
+                            "tools. Conclude now with the JSON object, using the "
+                            "evidence you already have. If you are genuinely "
+                            "uncertain, say so in the summary and give your best "
+                            "hypothesis with a low confidence value."),
+            })
         try:
             resp: ModelResponse = provider.complete(
                 system=SYSTEM,
-                messages=messages,
-                tools=telemetry_tools.TOOL_SCHEMAS,
+                messages=(_compact(messages)
+                          if getattr(provider, "compact_history", True)
+                          else messages),
+                tools=None if final_step else telemetry_tools.TOOL_SCHEMAS,
             )
         except Exception as exc:  # provider/network failure must not crash the loop
             inv.error = f"provider error: {exc}"
@@ -175,6 +261,14 @@ def investigate(cluster: Cluster, provider: Provider,
 
         if resp.text:
             inv.steps.append(Step(kind="thought", content=resp.text))
+
+        if not resp.wants_tools and not final_step:
+            gap = _missing_evidence(inv)
+            if gap and not nudged:
+                nudged = True
+                messages.append(provider.assistant_message(resp))
+                messages.append({"role": "user", "content": gap})
+                continue
 
         if not resp.wants_tools:
             parsed = _extract_json(resp.text)
@@ -200,6 +294,29 @@ def investigate(cluster: Cluster, provider: Provider,
                 inv.error = f"proposed unknown action: {action.get('action')!r}"
             inv.steps.append(Step(kind="conclusion", content=inv.summary))
             return inv
+
+        compared = sum(1 for st in inv.steps
+                       if st.tool_name == "compare_nodes")
+        incoming = sum(1 for c in resp.tool_calls if c.name == "compare_nodes")
+        if compared + incoming > MAX_METRIC_COMPARISONS and not steered:
+            steered = True
+            messages.append(provider.assistant_message(resp))
+            for call in resp.tool_calls:
+                result = telemetry_tools.call_tool(cluster, call.name, call.arguments)
+                inv.tool_calls_used += 1
+                inv.steps.append(Step(kind="tool",
+                                      content=f"{call.name}({call.arguments})",
+                                      tool_name=call.name, tool_args=call.arguments,
+                                      tool_result=result))
+                messages.append(provider.tool_result_message(call, result))
+            messages.append({"role": "user", "content": (
+                f"You have compared {compared + incoming} metrics "
+                "across nodes. Comparing more will not change the dispersion "
+                "picture. Spend your remaining calls on the other tools: "
+                "get_top_talkers shows whether a tenant changed its behaviour, "
+                "get_recent_events shows deploys and scaling, get_node_logs "
+                "explains a specific node.")})
+            continue
 
         messages.append(provider.assistant_message(resp))
         for call in resp.tool_calls:

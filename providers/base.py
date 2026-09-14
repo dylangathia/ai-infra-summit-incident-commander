@@ -13,6 +13,11 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()          # reads .env from the working directory if present
+except ImportError:
+    pass                   # optional; plain env vars still work
 
 @dataclass
 class ToolCall:
@@ -37,6 +42,10 @@ class Provider(Protocol):
     """Minimal surface the agent depends on."""
 
     name: str
+    # Real providers re-read the whole history each call, so the investigator
+    # truncates older tool results to stay inside token budgets. A provider
+    # that reconstructs its own state from that history must opt out.
+    compact_history: bool = True
 
     def complete(
         self,
@@ -63,7 +72,7 @@ def get_provider(name: Optional[str] = None) -> Provider:
     if name == "anthropic":
         from .anthropic_provider import AnthropicProvider
         return AnthropicProvider()
-    if name == "openai":
+    if name in ("openai", "groq", "cerebras", "openrouter"):
         from .openai_provider import OpenAIProvider
         return OpenAIProvider()
     if name == "echo":

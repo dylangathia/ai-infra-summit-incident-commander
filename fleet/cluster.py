@@ -63,6 +63,7 @@ class Cluster:
     events: List[dict] = field(default_factory=list)
     _window_reqs: List[Request] = field(default_factory=list)
     _window_shed: int = 0
+    _window_arrivals: Dict[str, int] = field(default_factory=dict)
     _acc: float = 0.0
     # agent-controlled ingress policy
     tenant_limits: Dict[str, float] = field(default_factory=dict)  # tenant -> admit fraction
@@ -101,6 +102,12 @@ class Cluster:
 
     def tick(self, incoming: List[Request]) -> Optional[Window]:
         for req in incoming:
+            # Offered load, counted at ingress before any policy or routing.
+            # Completions are not a demand signal: under saturation short
+            # requests finish and long ones time out, so a tenant can look
+            # like it shrank while it is actually sending more than ever.
+            self._window_arrivals[req.tenant] = \
+                self._window_arrivals.get(req.tenant, 0) + 1
             # --- ingress policy (agent-controlled) ---
             if req.tenant in self.tenant_limits:
                 if self._rng.random() > self.tenant_limits[req.tenant]:
@@ -140,6 +147,9 @@ class Cluster:
         ttft = [r.ttft for r in completed if r.ttft is not None]
 
         per_tenant: Dict[str, dict] = {}
+        for tenant, n in self._window_arrivals.items():
+            per_tenant.setdefault(
+                tenant, {"count": 0, "prompt_tokens": 0, "lat": []})["arrivals"] = n
         for r in completed:
             b = per_tenant.setdefault(
                 r.tenant, {"count": 0, "prompt_tokens": 0, "lat": []})
@@ -147,6 +157,7 @@ class Cluster:
             b["prompt_tokens"] += r.prompt_tokens
             b["lat"].append(r.latency)
         for name, b in per_tenant.items():
+            b.setdefault("arrivals", 0)
             lats = b.pop("lat")
             b["p99_ms"] = round(pct(lats, 99) * 1000)
             b["avg_prompt_tokens"] = round(b["prompt_tokens"] / max(1, b["count"]))
@@ -163,6 +174,7 @@ class Cluster:
             per_tenant=per_tenant,
         )
         self._window_shed = 0
+        self._window_arrivals = {}
         self.history.append(w)
         return w
 

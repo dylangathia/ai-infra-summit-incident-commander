@@ -28,7 +28,26 @@ COMPARABLE_METRICS = [
 ]
 
 
+MAX_WINDOW_S = 60.0
+
+
+def _clamp(seconds: float) -> float:
+    """A window wider than the incident averages the fault into the baseline.
+
+    Models reach for large windows expecting more signal and get less: a
+    tenant flooding for 40s inside a 300s average barely moves.
+    """
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        return 30.0
+    return max(5.0, min(seconds, MAX_WINDOW_S))
+
+
 def _recent(cluster: Cluster, seconds: float) -> List:
+    # No clamping here: internal callers legitimately ask for long windows
+    # (the baseline lookup wants 5x the analysis window). Clamping applies
+    # only to values the model supplies, at the public tool boundary.
     n = max(1, int(seconds / WINDOW_S))
     return list(cluster.history)[-n:]
 
@@ -43,6 +62,7 @@ def _avg(rows, attr) -> float:
 
 def get_cluster_summary(cluster: Cluster, window_s: float = 60.0) -> Dict[str, Any]:
     """Fleet-level health: is the SLO breached, by how much, and for how long."""
+    window_s = _clamp(window_s)
     recent = _recent(cluster, window_s)
     if not recent:
         return {"error": "no telemetry yet"}
@@ -58,6 +78,13 @@ def get_cluster_summary(cluster: Cluster, window_s: float = 60.0) -> Dict[str, A
             break
 
     return {
+        "slo_breached": now.p99 * 1000 > cluster.slo_p99_ms,
+        "throughput_direction": (
+            "RISING — demand-side; more work is arriving"
+            if now.throughput_rps > _avg(baseline, "throughput_rps") * 1.12
+            else "FALLING — supply-side; the fleet is serving less than it was"
+            if now.throughput_rps < _avg(baseline, "throughput_rps") * 0.88
+            else "FLAT — demand unchanged; the fleet is slower at the same load"),
         "slo_p99_ms": cluster.slo_p99_ms,
         "current": {
             "p50_ms": round(now.p50 * 1000),
@@ -76,7 +103,6 @@ def get_cluster_summary(cluster: Cluster, window_s: float = 60.0) -> Dict[str, A
             "p99_ms": round(_avg(baseline, "p99") * 1000),
             "throughput_rps": round(_avg(baseline, "throughput_rps"), 1),
         },
-        "slo_breached": now.p99 * 1000 > cluster.slo_p99_ms,
         "breach_duration_s": round(breach_windows * WINDOW_S, 1),
         "node_count": len(cluster.nodes),
         "nodes_accepting": sum(1 for n in cluster.nodes if n.accepting),
@@ -95,6 +121,7 @@ def compare_nodes(cluster: Cluster, metric: str = "queue_depth",
         return {"error": f"unknown metric '{metric}'",
                 "available": COMPARABLE_METRICS}
 
+    window_s = _clamp(window_s)
     recent = _recent(cluster, window_s)
     if not recent:
         return {"error": "no telemetry yet"}
@@ -146,13 +173,14 @@ def compare_nodes(cluster: Cluster, metric: str = "queue_depth",
         verdict = "MIXED — spread is elevated but no clear outlier"
 
     return {
-        "metric": metric,
-        "window_s": window_s,
-        "fleet_mean": round(mean, 3),
-        "robust_dispersion": round(cv, 3),
-        "nodes": rows,
-        "outliers": outliers,
         "dispersion_verdict": verdict,
+        "outliers": outliers,
+        "metric": metric,
+        "fleet_median": round(median, 3),
+        "window_s_used": _clamp(window_s),
+        "robust_dispersion": round(cv, 3),
+        "window_s": window_s,
+        "nodes": rows,
     }
 
 
@@ -168,6 +196,7 @@ def get_recent_events(cluster: Cluster, limit: int = 15) -> Dict[str, Any]:
 def get_top_talkers(cluster: Cluster, window_s: float = 30.0,
                     lookback_s: float = 150.0) -> Dict[str, Any]:
     """Per-tenant demand now versus earlier, in requests and in tokens."""
+    window_s = _clamp(window_s)
     n = max(1, int(window_s / WINDOW_S))
     history = list(cluster.history)
     recent = history[-n:]
@@ -182,9 +211,11 @@ def get_top_talkers(cluster: Cluster, window_s: float = 30.0,
         out: Dict[str, Dict[str, float]] = {}
         for w in rows:
             for tenant, b in w.per_tenant.items():
-                acc = out.setdefault(tenant, {"count": 0, "prompt_tokens": 0})
+                acc = out.setdefault(tenant, {"count": 0, "prompt_tokens": 0,
+                                              "arrivals": 0})
                 acc["count"] += b["count"]
                 acc["prompt_tokens"] += b["prompt_tokens"]
+                acc["arrivals"] += b.get("arrivals", 0)
         return out
 
     now, before = agg(recent), agg(earlier)
@@ -195,16 +226,18 @@ def get_top_talkers(cluster: Cluster, window_s: float = 30.0,
 
     tenants = []
     for name, v in sorted(now.items(), key=lambda kv: -kv[1]["count"]):
-        prev = before.get(name, {"count": 0, "prompt_tokens": 0})
+        prev = before.get(name, {"count": 0, "prompt_tokens": 0, "arrivals": 0})
         prev_avg = prev["prompt_tokens"] / max(1, prev["count"])
         cur_avg = v["prompt_tokens"] / max(1, v["count"])
-        cur_rate = v["count"] / now_windows
-        prev_rate = prev["count"] / before_windows
+        # rate is measured on arrivals (offered load), not completions
+        cur_rate = v.get("arrivals", v["count"]) / now_windows
+        prev_rate = prev.get("arrivals", prev["count"]) / before_windows
         prev_share = prev["count"] / max(1, total_before)
         cur_share = v["count"] / total_now
         tenants.append({
             "tenant": name,
-            "requests": int(v["count"]),
+            "requests_offered": int(v.get("arrivals", v["count"])),
+            "requests_served": int(v["count"]),
             "share_of_fleet": round(cur_share, 3),
             "share_of_fleet_before": round(prev_share, 3),
             "share_change": round(cur_share / prev_share, 2) if prev_share > 0 else None,
@@ -215,7 +248,32 @@ def get_top_talkers(cluster: Cluster, window_s: float = 30.0,
                 round(cur_avg / prev_avg, 2) if prev_avg > 0 else None),
         })
 
+    # Same idea as dispersion_verdict: compute the distinction rather than
+    # hoping the model infers it from a list. One tenant growing while the
+    # others shrink is a noisy neighbour. Every tenant growing together is
+    # fleet demand, and rate-limiting anyone there punishes the innocent.
+    grew = [t for t in tenants
+            if (t.get("request_rate_change") or 1.0) > 1.3]
+    shrank = [t for t in tenants
+              if (t.get("request_rate_change") or 1.0) < 0.85]
+    if len(grew) >= max(2, len(tenants) - 1):
+        demand_verdict = ("BROAD — every tenant is sending more; this is "
+                          "fleet-wide demand, not one tenant misbehaving")
+    elif len(grew) == 1 and shrank:
+        demand_verdict = (f"CONCENTRATED — {grew[0]['tenant']} grew while the "
+                          "others shrank; one tenant is crowding out the rest")
+    elif len(grew) == 1:
+        demand_verdict = f"CONCENTRATED — only {grew[0]['tenant']} grew"
+    else:
+        demand_verdict = ("FLAT — no tenant materially changed its request "
+                          "rate; if latency rose, the cause is not demand")
+
+    size_spikes = [t["tenant"] for t in tenants
+                   if (t.get("avg_prompt_size_change") or 1.0) > 1.8]
+
     return {
+        "demand_verdict": demand_verdict,
+        "tenants_sending_bigger_prompts": size_spikes,
         "window_s": window_s,
         "recent_window": [round(recent[0].t - window_s, 1), round(recent[-1].t, 1)] if recent else None,
         "baseline_window": [round(earlier[0].t - window_s, 1), round(earlier[-1].t, 1)] if earlier else None,
