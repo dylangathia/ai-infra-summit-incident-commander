@@ -165,15 +165,18 @@ def get_recent_events(cluster: Cluster, limit: int = 15) -> Dict[str, Any]:
     }
 
 
-def get_top_talkers(cluster: Cluster, window_s: float = 30.0) -> Dict[str, Any]:
+def get_top_talkers(cluster: Cluster, window_s: float = 30.0,
+                    lookback_s: float = 150.0) -> Dict[str, Any]:
     """Per-tenant demand now versus earlier, in requests and in tokens."""
     n = max(1, int(window_s / WINDOW_S))
     history = list(cluster.history)
     recent = history[-n:]
-    # Equal-length earlier window, offset by one full window, so the ratios
-    # below compare like with like. Comparing a 30s window against a 5s one
-    # makes every tenant look like it grew 6x.
-    earlier = history[-3 * n: -2 * n] if len(history) >= 3 * n else history[:n]
+    # The earlier window must sit BEFORE the incident began, or the ratios
+    # compare the incident against itself. A tenant flooding at 11x showed as
+    # 1.8x when the baseline window overlapped the flood.
+    back = max(1, int(lookback_s / WINDOW_S))
+    start = max(0, len(history) - back - n)
+    earlier = history[start:start + n] or history[:n]
 
     def agg(rows):
         out: Dict[str, Dict[str, float]] = {}
@@ -188,6 +191,7 @@ def get_top_talkers(cluster: Cluster, window_s: float = 30.0) -> Dict[str, Any]:
     now_windows = max(1, len(recent))
     before_windows = max(1, len(earlier))
     total_now = sum(v["count"] for v in now.values()) or 1
+    total_before = sum(v["count"] for v in before.values()) or 1
 
     tenants = []
     for name, v in sorted(now.items(), key=lambda kv: -kv[1]["count"]):
@@ -196,10 +200,14 @@ def get_top_talkers(cluster: Cluster, window_s: float = 30.0) -> Dict[str, Any]:
         cur_avg = v["prompt_tokens"] / max(1, v["count"])
         cur_rate = v["count"] / now_windows
         prev_rate = prev["count"] / before_windows
+        prev_share = prev["count"] / max(1, total_before)
+        cur_share = v["count"] / total_now
         tenants.append({
             "tenant": name,
             "requests": int(v["count"]),
-            "share_of_fleet": round(v["count"] / total_now, 3),
+            "share_of_fleet": round(cur_share, 3),
+            "share_of_fleet_before": round(prev_share, 3),
+            "share_change": round(cur_share / prev_share, 2) if prev_share > 0 else None,
             "avg_prompt_tokens": round(cur_avg),
             "request_rate_change": (
                 round(cur_rate / prev_rate, 2) if prev_rate > 0 else None),
@@ -209,11 +217,16 @@ def get_top_talkers(cluster: Cluster, window_s: float = 30.0) -> Dict[str, Any]:
 
     return {
         "window_s": window_s,
+        "recent_window": [round(recent[0].t - window_s, 1), round(recent[-1].t, 1)] if recent else None,
+        "baseline_window": [round(earlier[0].t - window_s, 1), round(earlier[-1].t, 1)] if earlier else None,
         "tenants": tenants,
         "note": ("request_count_change and avg_prompt_size_change are ratios "
                  "against an earlier window. A tenant sending the same number "
                  "of much larger requests is a different incident from one "
-                 "sending many more requests."),
+                 "sending many more requests. share_change is more robust than "
+                 "request_rate_change when the incident has been running a "
+                 "while: check the baseline_window timestamps against when the "
+                 "breach started, and raise lookback_s if they overlap."),
     }
 
 
