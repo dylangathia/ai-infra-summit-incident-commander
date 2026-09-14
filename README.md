@@ -101,3 +101,41 @@ The baseline window now sits 150s back by default, exposes its own timestamps
 so the caller can check for overlap, takes a `lookback_s` argument, and
 reports `share_change` alongside rate — share is far more robust when the
 incident has been running a while.
+
+## Closed loop (`python3 lifecycle.py echo`)
+
+`agent/commander.py` runs the full lifecycle: detect, investigate, validate,
+execute, verify, and either close with a postmortem or escalate with the
+failed hypothesis attached. All six scenarios resolve on the first attempt.
+
+| scenario | detected via | policy | time to resolution |
+|---|---|---|---|
+| thermal_throttle | latency_slo | **rewritten** (drain + replace) | 10s |
+| kv_exhaustion | latency_slo | approved | 100s |
+| noisy_neighbour | latency_slo | approved | 80s |
+| version_skew | **latency_regression** | approved | 5s |
+| cold_start_stall | latency_slo | **rewritten** (drain + replace) | 20s |
+| traffic_surge | latency_slo | approved | 35s |
+
+### Three findings from running the loop end to end
+
+**The policy layer earns its place on the very first scenario.** The
+investigator proposed draining the throttled node. Policy computed that the
+remaining nodes would have 3.0 effective capacity against demand of 3.9 and
+rewrote the action to bring up a replacement alongside the drain. Without
+that rewrite the incident gets worse, which is exactly what the earlier
+efficacy run measured (5250ms -> 9350ms).
+
+**Verification has to be patient, and patience has to be measured on the
+right signal.** A fixed 30s check failed two *correct* diagnoses, because
+capping context stops the bleeding instantly but the queue built during the
+incident still has to drain — p99 rises before it falls. The verifier now
+watches for up to 150s and treats a shrinking backlog as progress even while
+latency is flat, since queued requests carry their old wait time to
+completion. With that change, noisy_neighbour went from "misdiagnosed twice
+then accidentally fixed" to "correct on attempt 1".
+
+**Absolute thresholds never catch gray failures.** Version skew pushes p99 to
+roughly 1.7x baseline while staying under a 4000ms SLO, so the detector never
+fired at all. A third trigger compares against the trailing median rather than
+a fixed number, which is what an operator actually notices.
