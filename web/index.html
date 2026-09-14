@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Incident Commander — inference fleet</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --ground: #0e1419;
+        --panel: #151d24;
+        --line: #243039;
+        --line-soft: #1c262e;
+        --ink: #dfe7ec;
+        --ink-dim: #7d8d99;
+        --ink-faint: #4d5b66;
+        --ok: #3fbfa6;
+        --warn: #d9a441;
+        --bad: #e0614f;
+        --agent: #9a7ae0;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--ground);
+        color: var(--ink);
+        font-family: "IBM Plex Sans", system-ui, sans-serif;
+        font-size: 14px;
+        line-height: 1.5;
+      }
+      .num {
+        font-family: "IBM Plex Mono", monospace;
+        font-variant-numeric: tabular-nums;
+      }
+
+      header {
+        display: flex;
+        align-items: baseline;
+        gap: 18px;
+        flex-wrap: wrap;
+        padding: 16px 22px;
+        border-bottom: 1px solid var(--line);
+      }
+      header h1 {
+        font-size: 15px;
+        font-weight: 600;
+        margin: 0;
+        letter-spacing: 0.01em;
+      }
+      header .clock {
+        color: var(--ink-dim);
+        font-size: 12px;
+      }
+      header .spacer {
+        flex: 1;
+      }
+
+      .controls {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      select,
+      button {
+        font: inherit;
+        color: var(--ink);
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        padding: 6px 11px;
+        cursor: pointer;
+      }
+      button:hover,
+      select:hover {
+        border-color: #33414c;
+      }
+      button:focus-visible,
+      select:focus-visible {
+        outline: 2px solid var(--agent);
+        outline-offset: 2px;
+      }
+      button.primary {
+        background: #1d2b33;
+        border-color: #2c4049;
+        color: #cfe6e0;
+      }
+      button.danger:hover {
+        border-color: var(--bad);
+        color: #f0a598;
+      }
+
+      main {
+        display: grid;
+        grid-template-columns: 250px 1fr 420px;
+        gap: 1px;
+        background: var(--line-soft);
+        min-height: calc(100vh - 59px);
+      }
+      section {
+        background: var(--ground);
+        padding: 18px;
+      }
+      h2 {
+        font-size: 11px;
+        font-weight: 500;
+        color: var(--ink-faint);
+        margin: 0 0 14px;
+        letter-spacing: 0.06em;
+      }
+
+      /* fleet */
+      .node {
+        border: 1px solid var(--line);
+        border-left: 3px solid var(--ok);
+        border-radius: 5px;
+        padding: 9px 11px;
+        margin-bottom: 8px;
+        background: var(--panel);
+      }
+      .node.warn {
+        border-left-color: var(--warn);
+      }
+      .node.bad {
+        border-left-color: var(--bad);
+      }
+      .node.off {
+        border-left-color: var(--ink-faint);
+        opacity: 0.55;
+      }
+      .node .id {
+        font-weight: 600;
+        font-size: 13px;
+        display: flex;
+        justify-content: space-between;
+      }
+      .node .id em {
+        font-style: normal;
+        color: var(--ink-dim);
+        font-size: 11px;
+      }
+      .node .m {
+        display: flex;
+        justify-content: space-between;
+        color: var(--ink-dim);
+        font-size: 11px;
+        margin-top: 3px;
+      }
+      .node .m b {
+        font-weight: 500;
+        color: var(--ink);
+      }
+
+      /* metrics */
+      .big {
+        display: flex;
+        gap: 30px;
+        margin-bottom: 18px;
+        flex-wrap: wrap;
+      }
+      .big div span {
+        display: block;
+        color: var(--ink-faint);
+        font-size: 11px;
+        margin-bottom: 2px;
+      }
+      .big div strong {
+        font-size: 26px;
+        font-weight: 500;
+      }
+      .chart {
+        width: 100%;
+        height: 260px;
+        display: block;
+      }
+      .legend {
+        display: flex;
+        gap: 16px;
+        color: var(--ink-dim);
+        font-size: 11px;
+        margin-top: 8px;
+      }
+      .legend i {
+        display: inline-block;
+        width: 9px;
+        height: 2px;
+        vertical-align: middle;
+        margin-right: 5px;
+      }
+
+      .tenants {
+        margin-top: 22px;
+      }
+      .tenant {
+        display: flex;
+        justify-content: space-between;
+        padding: 5px 0;
+        border-bottom: 1px solid var(--line-soft);
+        font-size: 12px;
+        color: var(--ink-dim);
+      }
+      .tenant b {
+        color: var(--ink);
+        font-weight: 500;
+      }
+
+      /* agent stream */
+      .stream {
+        max-height: calc(100vh - 130px);
+        overflow-y: auto;
+        padding-right: 6px;
+      }
+      .ev {
+        border-left: 2px solid var(--line);
+        padding: 0 0 16px 14px;
+        position: relative;
+      }
+      .ev:before {
+        content: "";
+        position: absolute;
+        left: -5px;
+        top: 5px;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--line);
+      }
+      .ev .when {
+        color: var(--ink-faint);
+        font-size: 11px;
+      }
+      .ev .what {
+        font-weight: 600;
+        font-size: 12px;
+        margin: 1px 0 4px;
+      }
+      .ev p {
+        margin: 0 0 5px;
+        color: var(--ink-dim);
+        font-size: 12px;
+      }
+      .ev.open {
+        border-left-color: var(--bad);
+      }
+      .ev.open:before {
+        background: var(--bad);
+      }
+      .ev.diag {
+        border-left-color: var(--agent);
+      }
+      .ev.diag:before {
+        background: var(--agent);
+      }
+      .ev.pol {
+        border-left-color: var(--warn);
+      }
+      .ev.pol:before {
+        background: var(--warn);
+      }
+      .ev.act {
+        border-left-color: var(--ink-dim);
+      }
+      .ev.act:before {
+        background: var(--ink-dim);
+      }
+      .ev.good {
+        border-left-color: var(--ok);
+      }
+      .ev.good:before {
+        background: var(--ok);
+      }
+      .tool {
+        color: var(--ink-faint);
+        font-size: 11px;
+        padding: 1px 0;
+      }
+      .tool b {
+        color: var(--ink-dim);
+        font-weight: 500;
+      }
+      .verdict {
+        display: inline-block;
+        padding: 1px 7px;
+        border-radius: 3px;
+        font-size: 11px;
+        border: 1px solid var(--line);
+      }
+      .verdict.rewritten {
+        color: var(--warn);
+        border-color: #4a3c22;
+      }
+      .verdict.approved {
+        color: var(--ok);
+        border-color: #1f4840;
+      }
+      .verdict.refused {
+        color: var(--bad);
+        border-color: #4d2823;
+      }
+      .empty {
+        color: var(--ink-faint);
+        font-size: 12px;
+      }
+      pre.pm {
+        white-space: pre-wrap;
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 11px;
+        color: var(--ink-dim);
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        padding: 11px;
+        margin: 6px 0 0;
+      }
+      @media (max-width: 1100px) {
+        main {
+          grid-template-columns: 1fr;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        * {
+          transition: none !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Incident Commander</h1>
+      <span class="clock num" id="clock">t = 0s</span>
+      <span class="spacer"></span>
+      <div class="controls">
+        <select id="fault">
+          <option value="">Random fault</option>
+        </select>
+        <button class="primary" id="inject">Break the fleet</button>
+        <button id="toggle">Pause agent</button>
+        <button class="danger" id="reset">Reset</button>
+      </div>
+    </header>
+
+    <main>
+      <section>
+        <h2>Fleet</h2>
+        <div id="nodes"></div>
+      </section>
+
+      <section>
+        <h2>Latency and load</h2>
+        <div class="big">
+          <div><span>p99</span><strong class="num" id="p99">—</strong></div>
+          <div><span>SLO</span><strong class="num" id="slo">—</strong></div>
+          <div>
+            <span>Throughput</span><strong class="num" id="rps">—</strong>
+          </div>
+          <div><span>Errors</span><strong class="num" id="err">—</strong></div>
+        </div>
+        <svg class="chart" id="chart" preserveAspectRatio="none"></svg>
+        <div class="legend">
+          <span><i style="background: var(--ok)"></i>p99 latency</span>
+          <span><i style="background: var(--bad)"></i>SLO threshold</span>
+          <span><i style="background: var(--warn)"></i>throughput</span>
+        </div>
+        <div class="tenants">
+          <h2>Tenants</h2>
+          <div id="tenants"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>What the agent is doing</h2>
+        <div class="stream" id="stream">
+          <p class="empty">
+            Fleet is healthy. Break it and the agent will investigate on its
+            own.
+          </p>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      let revealed = null;
+
+      function nodeClass(n) {
+        if (n.state === "draining" || n.state === "offline") return "node off";
+        if (n.state === "loading") return "node bad";
+        if (n.clock_factor < 0.9 || n.kv_util > 0.9 || n.quantization !== "fp8")
+          return "node warn";
+        if (n.queue_depth > 40) return "node warn";
+        return "node";
+      }
+
+      function drawNodes(nodes) {
+        $("nodes").innerHTML = nodes
+          .map(
+            (n) => `
+    <div class="${nodeClass(n)}">
+      <div class="id">${n.node_id}<em>${n.state}</em></div>
+      <div class="m"><span>queue</span><b class="num">${n.queue_depth}</b></div>
+      <div class="m"><span>batch</span><b class="num">${n.batch_size}</b></div>
+      <div class="m"><span>kv</span><b class="num">${Math.round(n.kv_util * 100)}%</b></div>
+      <div class="m"><span>temp</span><b class="num">${n.temp_c}°C</b></div>
+      <div class="m"><span>clock</span><b class="num">${n.clock_factor}×</b></div>
+      ${n.quantization !== "fp8" ? `<div class="m"><span>quant</span><b>${n.quantization}</b></div>` : ""}
+    </div>`,
+          )
+          .join("");
+      }
+
+      function drawChart(p99, rps, slo) {
+        const W = 800,
+          H = 260,
+          pad = 6;
+        if (!p99.length) {
+          $("chart").innerHTML = "";
+          return;
+        }
+        const top = Math.max(slo * 1.35, ...p99) * 1.05;
+        const x = (i) =>
+          pad + (i * (W - 2 * pad)) / Math.max(1, p99.length - 1);
+        const y = (v) => H - pad - (v / top) * (H - 2 * pad);
+        const maxRps = Math.max(10, ...rps);
+        const line = (arr, f) =>
+          arr
+            .map(
+              (v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${f(v).toFixed(1)}`,
+            )
+            .join("");
+        const area = `${line(p99, y)}L${x(p99.length - 1)},${H - pad}L${x(0)},${H - pad}Z`;
+        $("chart").setAttribute("viewBox", `0 0 ${W} ${H}`);
+        $("chart").innerHTML = `
+    <defs><linearGradient id="g" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0%" stop-color="#3fbfa6" stop-opacity=".22"/>
+      <stop offset="100%" stop-color="#3fbfa6" stop-opacity="0"/>
+    </linearGradient></defs>
+    <rect x="${pad}" y="${pad}" width="${W - 2 * pad}" height="${y(slo) - pad}"
+          fill="#e0614f" opacity=".05"/>
+    <path d="${area}" fill="url(#g)"/>
+    <path d="${line(rps, (v) => H - pad - (v / maxRps) * (H - 2 * pad) * 0.5)}"
+          fill="none" stroke="#d9a441" stroke-width="1" opacity=".5"/>
+    <path d="${line(p99, y)}" fill="none" stroke="#3fbfa6" stroke-width="1.75"/>
+    <line x1="${pad}" x2="${W - pad}" y1="${y(slo)}" y2="${y(slo)}"
+          stroke="#e0614f" stroke-width="1" stroke-dasharray="4 4"/>`;
+      }
+
+      function evHtml(e) {
+        const t = `<span class="when num">t=${e.t}s</span>`;
+        if (e.kind === "incident_opened")
+          return `<div class="ev open">${t}<div class="what">Incident ${e.incident_id} opened</div>
+            <p>${e.note}</p></div>`;
+        if (e.kind === "investigation") {
+          const tools = (e.trace || [])
+            .filter((s) => s.kind === "tool")
+            .map(
+              (s) =>
+                `<div class="tool"><b>${s.tool}</b> ${JSON.stringify(s.args || {})}</div>`,
+            )
+            .join("");
+          const ev = (e.evidence || []).map((x) => `<p>— ${x}</p>`).join("");
+          const ro = (e.ruled_out || [])
+            .map((r) => `<p>Ruled out ${r.cause}: ${r.why}</p>`)
+            .join("");
+          return `<div class="ev diag">${t}<div class="what">Diagnosis: ${e.root_cause}
+            (confidence ${e.confidence})</div>${tools}${ev}${ro}</div>`;
+        }
+        if (e.kind === "policy") {
+          const d = e.decision || {};
+          return `<div class="ev pol">${t}<div class="what">Policy
+            <span class="verdict ${d.verdict}">${d.verdict}</span></div>
+            <p>Proposed ${e.proposed.action} ${JSON.stringify(e.proposed.args || {})}</p>
+            <p>${d.reason || ""}</p></div>`;
+        }
+        if (e.kind === "executed")
+          return `<div class="ev act">${t}<div class="what">Acted</div>
+            <p>${(e.results || []).join("; ") || "nothing"}</p></div>`;
+        if (e.kind === "verify_progress")
+          return `<div class="ev act">${t}<div class="what">Watching</div>
+            <p>p99 ${e.p99_ms}ms, backlog ${e.backlog ?? "—"} — improving, holding off</p></div>`;
+        if (e.kind === "verification")
+          return `<div class="ev ${e.verified ? "good" : "open"}">${t}
+            <div class="what">${e.verified ? "Recovered" : "Action failed"}</div>
+            <p>p99 ${e.p99_before_ms}ms → ${e.p99_after_ms}ms. ${e.note || ""}</p></div>`;
+        if (e.kind === "escalated_to_human")
+          return `<div class="ev open">${t}<div class="what">Escalated to a human</div>
+            <p>${e.attempts} attempts did not resolve it.</p></div>`;
+        if (e.kind === "postmortem")
+          return `<div class="ev good">${t}<div class="what">Postmortem</div>
+            <pre class="pm">${e.text}</pre></div>`;
+        if (e.kind === "agent_error")
+          return `<div class="ev open">${t}<div class="what">Agent error</div><p>${e.error}</p></div>`;
+        return "";
+      }
+
+      function render(s) {
+        $("clock").textContent = `t = ${s.t}s · ${s.speed}× speed`;
+        $("slo").textContent = `${s.slo_p99_ms}ms`;
+        if (s.latest) {
+          $("p99").textContent = `${s.latest.p99_ms}ms`;
+          $("p99").style.color =
+            s.latest.p99_ms > s.slo_p99_ms ? "var(--bad)" : "var(--ok)";
+          $("rps").textContent = `${s.latest.throughput_rps}/s`;
+          $("err").textContent = `${(s.latest.error_rate * 100).toFixed(1)}%`;
+          $("err").style.color =
+            s.latest.error_rate > 0.01 ? "var(--warn)" : "var(--ink)";
+        }
+        drawNodes(s.nodes || []);
+        drawChart(s.p99_series || [], s.rps_series || [], s.slo_p99_ms);
+        $("tenants").innerHTML =
+          Object.entries(s.tenants || {})
+            .map(
+              ([k, v]) =>
+                `<div class="tenant"><span>${k}</span>
+     <b class="num">${v.count} req · ${v.avg_prompt_tokens} tok · p99 ${v.p99_ms}ms</b></div>`,
+            )
+            .join("") || `<p class="empty">No traffic yet.</p>`;
+
+        const html = (s.events || [])
+          .map(evHtml)
+          .filter(Boolean)
+          .reverse()
+          .join("");
+        $("stream").innerHTML =
+          html ||
+          `<p class="empty">Fleet is healthy. Break it and the agent will investigate on its own.</p>` +
+            (revealed ? `<p class="empty">Injected: ${revealed}</p>` : "");
+        if (!s.catalogue) return;
+        const sel = $("fault");
+        if (sel.options.length <= 1)
+          s.catalogue.forEach((f) => sel.add(new Option(f.label, f.key)));
+      }
+
+      $("inject").onclick = async () => {
+        const key = $("fault").value;
+        const r = await (
+          await fetch(`/api/inject${key ? `?key=${key}` : ""}`, {
+            method: "POST",
+          })
+        ).json();
+        revealed = r.reveal_label;
+        $("inject").textContent = "Fault injected";
+        setTimeout(() => ($("inject").textContent = "Break the fleet"), 2500);
+      };
+      $("reset").onclick = async () => {
+        await fetch("/api/reset", { method: "POST" });
+        revealed = null;
+      };
+      $("toggle").onclick = async (e) => {
+        const on = e.target.textContent.startsWith("Pause");
+        await fetch(`/api/agent?enabled=${!on}`, { method: "POST" });
+        e.target.textContent = on ? "Resume agent" : "Pause agent";
+      };
+
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      let sock;
+      function connect() {
+        sock = new WebSocket(`${proto}://${location.host}/ws`);
+        sock.onmessage = (e) => render(JSON.parse(e.data));
+        sock.onclose = () => setTimeout(connect, 1500);
+      }
+      connect();
+    </script>
+  </body>
+</html>

@@ -139,3 +139,76 @@ then accidentally fixed" to "correct on attempt 1".
 roughly 1.7x baseline while staying under a 4000ms SLO, so the detector never
 fired at all. A third trigger compares against the trailing median rather than
 a fixed number, which is what an operator actually notices.
+
+## Business value (`python3 -m evals.compare --provider echo --seeds 3`)
+
+The control arm is **not** "do nothing". It is a competent on-call engineer
+who is paged, arrives after 5 minutes, and applies the correct remedy first
+time. Beating a strawman proves nothing.
+
+18 incidents (6 scenarios x 3 seeds), identical faults and seeds in both arms:
+
+| | human on-call | agent | change |
+|---|---|---|---|
+| Degraded serving time | 67.2 min | 14.6 min | **-78%** |
+| Requests served over SLO | 262,923 | 62,768 | **-76%** |
+| Degraded GPU-hours | 4.62 | 1.11 | **-76%** |
+| Correct resolution | given | 18/18 | — |
+
+Per incident: 2.9 fewer minutes degraded, 0.195 GPU-hours recovered on a
+4-node fleet. Extrapolated (and labelled as extrapolation in the output) to a
+200-node fleet at 15 incidents/month: ~146 GPU-hours/month, about $381/month
+at $2.60/node-hour, before counting the reduction in SLO-violating requests.
+
+The honest framing: most of the gain is MTTD, not cleverness. The agent
+detects in 7-15s what takes a human 13-35s to even be paged about, and never
+loses the 5 minutes it takes a person to reach a keyboard.
+
+### The two hardest bugs, both found by the eval
+
+**A stalled node held a steady 1.5-2% error rate, just under a 2% threshold,
+while p99 moved from 2100ms to 2400ms.** Neither trigger fired. The incident
+would have run indefinitely. Error detection is now relative to the fleet's
+own baseline — 0.0% normal to 1.5% sustained is an enormous regression even
+though no absolute threshold is crossed. This is the most realistic failure
+in the whole catalogue and the best argument in the pitch: the incidents that
+cost the most are the ones your dashboard is configured not to see.
+
+**Timeout errors arrive in bursts** as queued requests expire together, so a
+rule requiring consecutive windows over threshold never fired. Detection now
+averages over a span.
+
+## Running it
+
+```bash
+pip install -r requirements.txt
+uvicorn api.app:app --port 8000          # open http://localhost:8000
+```
+
+The fleet ticks on a wall clock at 8x speed. Pick a fault or leave it on
+random, press **Break the fleet**, and watch the right-hand column: the agent
+detects, calls tools, proposes an action, policy approves or rewrites it, and
+the verifier waits until the fleet recovers before closing with a postmortem.
+
+`POST /api/inject` returns the ground truth in `reveal_label`, but the UI does
+not show it in the event stream. A judge can trigger a random fault, read the
+agent's diagnosis, and only then check what was actually injected.
+
+Set the provider with an environment variable — no code change:
+
+```bash
+IC_PROVIDER=echo                                    # rules, no API key needed
+IC_PROVIDER=anthropic IC_MODEL=claude-haiku-4-5-20251001 ANTHROPIC_API_KEY=...
+```
+
+Deploy: `Procfile` for Railway or Render, `Dockerfile` for Fly. One service,
+one URL — the dashboard is served by the same process as the API, so there is
+no separate frontend to deploy or CORS to configure.
+
+### Note on the live loop
+
+The commander runs in a worker thread and its `advance()` callback sleeps in
+wall-clock time rather than stepping the simulation. The fleet therefore keeps
+degrading while the agent is thinking, which is how a real incident behaves —
+it does not pause for the on-call engineer. It also means the demo shows
+honest time-to-resolution rather than a frozen frame.

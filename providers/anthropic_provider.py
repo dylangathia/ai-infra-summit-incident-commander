@@ -15,7 +15,14 @@ class AnthropicProvider:
     name = "anthropic"
 
     def __init__(self, model: str = DEFAULT_MODEL, api_key: Optional[str] = None):
-        import anthropic  # imported lazily so the sim runs without the SDK
+        try:
+            import anthropic  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "anthropic is required to use the AnthropicProvider. "
+                "Install it with: pip install anthropic"
+            ) from exc
+
         self.model = model
         self.client = anthropic.Anthropic(
             api_key=api_key or os.environ.get("ANTHROPIC_API_KEY")

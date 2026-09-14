@@ -39,11 +39,16 @@ class Incident:
 class Detector:
     breach_windows_required: int = 2      # sustained, not a single spike
     error_rate_threshold: float = 0.02
-    error_windows_required: int = 2
+    # Averaged over a span, NOT consecutive windows. Timeout errors arrive in
+    # bursts as queued requests expire together, so a consecutive-window rule
+    # never fires on a stalled node even while it fails hundreds of requests.
+    error_windows_required: int = 4
     # Gray failures never cross an absolute threshold. A node serving at 60%
     # of fleet speed pushes p99 to ~1.7x baseline while staying under SLO,
     # and an absolute-threshold detector never fires at all.
     regression_multiple: float = 1.5
+    error_floor: float = 0.005              # 0.5% sustained is never normal here
+    error_regression_multiple: float = 3.0
     regression_windows_required: int = 3
     cooldown_s: float = 30.0
     _last_close_t: float = -1e9
@@ -59,8 +64,14 @@ class Detector:
 
         lat_breach = [w.p99 * 1000 > cluster.slo_p99_ms
                       for w in hist[-self.breach_windows_required:]]
-        err_breach = [w.error_rate > self.error_rate_threshold
-                      for w in hist[-self.error_windows_required:]]
+        err_span = hist[-self.error_windows_required:]
+        err_mean = sum(w.error_rate for w in err_span) / len(err_span)
+        # Relative, like latency. A fleet whose normal error rate is 0.0% and
+        # which now steadily fails 1.5% of requests is badly broken, but a
+        # fixed 2% threshold never fires — and that incident runs for weeks.
+        ref_err = self._reference_error(hist)
+        err_limit = max(self.error_floor, ref_err * self.error_regression_multiple)
+        err_breach = err_mean > err_limit
 
         reference = self._reference_p99(hist)
         reg_breach = []
@@ -71,7 +82,7 @@ class Detector:
         trigger = None
         if all(lat_breach):
             trigger = "latency_slo"
-        elif all(err_breach):
+        elif err_breach:
             trigger = "error_rate"
         elif reg_breach and len(reg_breach) >= self.regression_windows_required \
                 and all(reg_breach):
@@ -85,7 +96,7 @@ class Detector:
             if trigger == "latency_slo":
                 bad = w.p99 * 1000 > cluster.slo_p99_ms
             elif trigger == "error_rate":
-                bad = w.error_rate > self.error_rate_threshold
+                bad = w.error_rate > err_limit * 0.5
             else:
                 bad = w.p99 * 1000 > (reference or 0) * self.regression_multiple
             if bad:
@@ -96,7 +107,8 @@ class Detector:
         note = (
             f"Trigger: {trigger}. "
             f"p99 {latest.p99 * 1000:.0f}ms against an SLO of {cluster.slo_p99_ms:.0f}ms, "
-            f"error rate {latest.error_rate:.1%}, "
+            f"error rate {latest.error_rate:.1%} "
+            f"(sustained {err_mean:.1%} against a normal of {ref_err:.1%}), "
             f"throughput {latest.throughput_rps:.1f} rps. "
             f"Condition has held for {run * WINDOW_S:.0f}s."
             + (f" Baseline p99 for this fleet is around {reference:.0f}ms."
@@ -111,6 +123,13 @@ class Detector:
             error_rate_at_open=latest.error_rate,
             detected_after_s=run * WINDOW_S,
         )
+
+    @staticmethod
+    def _reference_error(hist) -> float:
+        if len(hist) < 9:
+            return 0.0
+        older = hist[: max(3, len(hist) // 3)]
+        return statistics.median(w.error_rate for w in older)
 
     @staticmethod
     def _reference_p99(hist) -> Optional[float]:

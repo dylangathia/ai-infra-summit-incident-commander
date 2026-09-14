@@ -1,4 +1,19 @@
-"""OpenAI-compatible implementation. Mirror the Anthropic adapter."""
+"""OpenAI-compatible provider.
+
+Not a copy of the Anthropic one. Four things genuinely differ: tool schema
+shape, where the system prompt goes, how tool arguments arrive (a JSON
+*string*, not a dict), and how tool results are returned.
+
+Because the base URL is configurable, this one file also covers Groq,
+Cerebras, Together and OpenRouter — all of which speak the OpenAI wire
+format and several of which have free tiers:
+
+    IC_PROVIDER=openai \\
+    OPENAI_BASE_URL=https://api.groq.com/openai/v1 \\
+    OPENAI_API_KEY=gsk_... \\
+    IC_MODEL=llama-3.3-70b-versatile \\
+    python3 diagnose.py openai
+"""
 
 from __future__ import annotations
 
@@ -11,83 +26,86 @@ from .base import ModelResponse, ToolCall
 DEFAULT_MODEL = os.environ.get("IC_MODEL", "gpt-4o-mini")
 
 
+def to_openai_tools(tools: List[dict]) -> List[dict]:
+    """Anthropic-shaped schemas are canonical in this repo; translate here."""
+    out = []
+    for t in tools:
+        out.append({
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t.get("input_schema")
+                              or {"type": "object", "properties": {}},
+            },
+        })
+    return out
+
+
 class OpenAIProvider:
     name = "openai"
 
-    def __init__(self, model: str = DEFAULT_MODEL, api_key: Optional[str] = None):
-        from openai import OpenAI  # imported lazily so the sim runs without the SDK
-
+    def __init__(self, model: str = DEFAULT_MODEL,
+                 api_key: Optional[str] = None,
+                 base_url: Optional[str] = None):
+        try:
+            from openai import OpenAI  # lazy: the sim runs without the SDK
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "openai is required to use the OpenAIProvider. "
+                "Install it with: pip install openai"
+            ) from exc
         self.model = model
-        self.client = OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"))
+        self.client = OpenAI(
+            api_key=api_key or os.environ.get("OPENAI_API_KEY"),
+            base_url=base_url or os.environ.get("OPENAI_BASE_URL") or None,
+        )
 
     def complete(self, system, messages, tools=None, max_tokens=1500,
                  temperature=0.0) -> ModelResponse:
-        chat_messages: List[Dict[str, Any]] = []
-        if system:
-            chat_messages.append({"role": "system", "content": system})
-        chat_messages.extend(messages)
+        payload: List[Dict[str, Any]] = [{"role": "system", "content": system}]
+        payload.extend(messages)
 
         kwargs: Dict[str, Any] = {
             "model": self.model,
-            "messages": chat_messages,
-            "temperature": temperature,
+            "messages": payload,
             "max_tokens": max_tokens,
+            "temperature": temperature,
         }
         if tools:
-            kwargs["tools"] = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool.get("name"),
-                        "description": tool.get("description", ""),
-                        "parameters": tool.get("input_schema", {"type": "object"}),
-                    },
-                }
-                for tool in tools
-            ]
+            kwargs["tools"] = to_openai_tools(tools)
+            kwargs["tool_choice"] = "auto"
 
         resp = self.client.chat.completions.create(**kwargs)
         msg = resp.choices[0].message
 
-        text = msg.content or ""
         calls: List[ToolCall] = []
-        for call in msg.tool_calls or []:
-            raw_args = call.function.arguments or "{}"
+        for tc in (msg.tool_calls or []):
             try:
-                parsed = json.loads(raw_args)
+                # arguments arrive as a JSON string, not a dict
+                args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError:
-                parsed = {"raw": raw_args}
-            calls.append(
-                ToolCall(
-                    id=call.id,
-                    name=call.function.name,
-                    arguments=parsed if isinstance(parsed, dict) else {"value": parsed},
-                )
-            )
+                args = {}
+            calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args))
 
-        finish_reason = getattr(resp.choices[0], "finish_reason", None)
         return ModelResponse(
-            text=text,
+            text=(msg.content or "").strip(),
             tool_calls=calls,
             raw=resp,
-            stop_reason=finish_reason,
+            stop_reason=resp.choices[0].finish_reason,
         )
 
     def assistant_message(self, response: ModelResponse) -> Dict[str, Any]:
-        out: Dict[str, Any] = {"role": "assistant", "content": response.text or ""}
+        msg: Dict[str, Any] = {"role": "assistant",
+                               "content": response.text or None}
         if response.tool_calls:
-            out["tool_calls"] = [
-                {
-                    "id": c.id,
-                    "type": "function",
-                    "function": {
-                        "name": c.name,
-                        "arguments": json.dumps(c.arguments, default=str),
-                    },
-                }
-                for c in response.tool_calls
-            ]
-        return out
+            msg["tool_calls"] = [{
+                "id": c.id,
+                "type": "function",
+                "function": {"name": c.name,
+                             "arguments": json.dumps(c.arguments)},
+            } for c in response.tool_calls]
+        return msg
 
     def tool_result_message(self, call: ToolCall, result: Any) -> Dict[str, Any]:
         return {
