@@ -106,6 +106,25 @@ class Policy:
                     reason=(f"would leave {healthy_after} healthy node(s), "
                             f"below the floor of {self.min_healthy_nodes}"))
 
+            if action == "rollback_node":
+                # A rollback only means anything for a node that is serving a
+                # different build. A node hung loading weights is not serving
+                # at all — rolling it back leaves it in rotation, still
+                # attracting traffic it cannot answer.
+                if node.state == NodeState.LOADING:
+                    return Decision(
+                        "rewritten", "drain_node", {"node_id": node_id},
+                        reason=(f"{node_id} is still loading weights, not "
+                                f"serving a bad build — a rollback would leave "
+                                f"it in rotation; draining instead"),
+                        requires_approval=not self.auto_approve_destructive)
+                if (node.quantization == "fp8"
+                        and node.model_version == "llama-3.1-70b@v4"):
+                    return Decision(
+                        "refused", "no_action", {},
+                        reason=(f"{node_id} is already on the baseline build "
+                                f"(fp8 @v4); there is nothing to roll back"))
+
             if action == "drain_node":
                 remaining = self._serving_capacity(cluster, excluding=node_id)
                 demand = self._demand(cluster)
